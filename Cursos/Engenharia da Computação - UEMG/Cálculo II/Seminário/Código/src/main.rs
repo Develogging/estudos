@@ -8,6 +8,8 @@ const LEN2: f32 = 80.0;
 // Taxa de aprendizado para o Gradient Descent.
 // Um valor pequeno evita oscilações.
 const LEARNING_RATE: f32 = 0.0001;
+// Velocidade máxima de rotação (radianos) por frame. ~0.1 rad = 5.7 graus
+const MAX_STEP_PER_FRAME: f32 = 0.1;
 // Distância de erro mínima para parar a otimização
 const STOP_THRESHOLD: f32 = 1.0;
 
@@ -78,92 +80,71 @@ fn update_target_position(
     }
 }
 
-/// Sistema Bevy que implementa o "exemplo e resolver" [cite: Orientações].
-/// Este é o núcleo do seu trabalho: Otimização por Gradient Descent.
+/// O Solver Híbrido: Analítico (Longe) + Gradient Descent (Perto)
 fn ik_solver_system(mut arm: ResMut<ArmState>, target: Res<Target>) {
-    // --- CONEXÃO COM O CÁLCULO ---
-    // Este sistema implementa a Seção 3.3 da sua Metodologia [cite: artigo_ik.md].
-
-    // Parâmetros do braço
     let l1 = LEN1;
     let l2 = LEN2;
     let max_reach = l1 + l2;
-    let t1 = arm.angles.x; // theta1 (ombro)
-    let t2 = arm.angles.y; // theta2 (cotovelo)
 
-    // --- PASSO 1: Cinemática Direta (FK) ---
-    // Calcula a posição atual da ponta (efetuador final) `s`
-    // Posição da Junta 1 (cotovelo)
-    let j1 = Vec2::new(l1 * t1.cos(), l1 * t1.sin());
-    // Posição da Junta 2 (ponta)
-    let s = j1 + Vec2::new(l2 * (t1 + t2).cos(), l2 * (t1 + t2).sin());
+    // --- SUB-STEPPING ---
+    // Dividimos o frame em 10 passos menores.
+    // Isso aumenta drasticamente a estabilidade e precisão da simulação.
+    const SOLVER_STEPS: usize = 10;
 
-    // --- CORREÇÃO DO "DEBATE" (JITTER) ---
-    // Verifique a distância até o alvo.
-    let mut target_pos = target.pos;
-    let distance_to_target = target_pos.length();
+    // Ajustamos as constantes para o sub-step
+    let sub_lr = LEARNING_RATE / SOLVER_STEPS as f32;
+    let sub_max_step = MAX_STEP_PER_FRAME / SOLVER_STEPS as f32;
 
-    // Se o alvo estiver fora do alcance máximo...
-    if distance_to_target > max_reach {
-        // ... "prenda" (clamp) o alvo na borda do círculo de alcance máximo.
-        // Isso dá ao otimizador um alvo alcançável e previne a instabilidade.
-        target_pos = target_pos.normalize() * max_reach;
+    for _ in 0..SOLVER_STEPS {
+        let t1 = arm.angles.x;
+        let t2 = arm.angles.y;
+
+        // FK (Cinemática Direta)
+        let j1 = Vec2::new(l1 * t1.cos(), l1 * t1.sin());
+        let s = j1 + Vec2::new(l2 * (t1 + t2).cos(), l2 * (t1 + t2).sin());
+
+        let dist_to_target = target.pos.length();
+
+        // --- CASO 1: ALVO FORA DE ALCANCE (Solução Analítica) ---
+        // Resolve o problema de "não estender" e o "jitter na ponta".
+        if dist_to_target > max_reach {
+            // Ângulo global para o alvo
+            let target_angle = target.pos.y.atan2(target.pos.x);
+
+            // 1. Queremos que o Ombro (t1) aponte para o alvo
+            let mut diff_t1 = target_angle - t1;
+            // Garante que giramos pelo lado mais curto (-PI a +PI)
+            diff_t1 = (diff_t1 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+
+            // 2. Queremos que o Cotovelo (t2) seja 0 (braço reto)
+            let diff_t2 = 0.0 - t2;
+
+            // Aplicamos a mudança suavemente (sem teleporte)
+            arm.angles.x += diff_t1.clamp(-sub_max_step, sub_max_step);
+            arm.angles.y += diff_t2.clamp(-sub_max_step, sub_max_step);
+        }
+        // --- CASO 2: ALVO DENTRO DE ALCANCE (Gradient Descent) ---
+        else {
+            let e = target.pos - s;
+            if e.length_squared() < STOP_THRESHOLD.powi(2) {
+                continue;
+            }
+
+            // Jacobiano Transposto
+            let j11 = -l1 * t1.sin() - l2 * (t1 + t2).sin();
+            let j12 = -l2 * (t1 + t2).sin();
+            let j21 = l1 * t1.cos() + l2 * (t1 + t2).cos();
+            let j22 = l2 * (t1 + t2).cos();
+
+            let d_t1 = j11 * e.x + j21 * e.y;
+            let d_t2 = j12 * e.x + j22 * e.y;
+
+            // Atualização com Amortecimento
+            arm.angles.x += (sub_lr * d_t1).clamp(-sub_max_step, sub_max_step);
+            arm.angles.y += (sub_lr * d_t2).clamp(-sub_max_step, sub_max_step);
+        }
     }
-
-    // --- PASSO 2: Calcular a Função de Custo (Erro) ---
-    // O erro é a diferença entre o alvo `t` e a posição atual `s`
-    let e = target_pos - s;
-    let error_distance_sq = e.length_squared();
-
-    // Se estivermos perto o suficiente, pare a otimização.
-    if error_distance_sq < STOP_THRESHOLD.powi(2) {
-        return;
-    }
-
-    // --- PASSO 3: Calcular o Jacobiano (J) ---
-    // J é a matriz de derivadas parciais [ds/d(theta)]
-    // J = | dx/dt1  dx/dt2 |
-    //     | dy/dt1  dy/dt2 |
-
-    // s.x = l1*cos(t1) + l2*cos(t1+t2)
-    // s.y = l1*sin(t1) + l2*sin(t1+t2)
-
-    // Derivadas parciais (as 4 equações de cálculo)
-    let j11 = -l1 * t1.sin() - l2 * (t1 + t2).sin(); // dx/dt1
-    let j12 = -l2 * (t1 + t2).sin(); // dx/dt2
-    let j21 = l1 * t1.cos() + l2 * (t1 + t2).cos(); // dy/dt1
-    let j22 = l2 * (t1 + t2).cos(); // dy/dt2
-
-    // --- PASSO 4: Otimização (Gradient Descent) ---
-    // Aplicamos o algoritmo derivado na Metodologia:
-    // delta_theta = alpha * J^T * e
-
-    // Calcular J^T * e
-    // J^T = | j11  j21 |
-    //       | j12  j22 |
-    // (J^T * e)_1 = j11*e.x + j21*e.y
-    // (J^T * e)_2 = j12*e.x + j22*e.y
-    let delta_t1 = j11 * e.x + j21 * e.y;
-    let delta_t2 = j12 * e.x + j22 * e.y;
-
-    // --- PASSO 5: Atualizar os Ângulos ---
-    // Aplica a taxa de aprendizado
-    let mut dt1 = LEARNING_RATE * delta_t1;
-    let mut dt2 = LEARNING_RATE * delta_t2;
-
-    // --- NOVA CORREÇÃO: "AMORTECIMENTO" (DAMPING) ---
-    // Limita a mudança máxima por frame para evitar "debater" (jitter)
-    // Este é um "amortecimento" manual que previne instabilidade
-    // perto de singularidades (quando o braço está totalmente esticado).
-    // Isto simula o efeito de algoritmos mais complexos como "Damped Least Squares".
-    const MAX_STEP_PER_FRAME: f32 = 0.02; // Limite de ~1.15 graus por frame
-    dt1 = dt1.clamp(-MAX_STEP_PER_FRAME, MAX_STEP_PER_FRAME);
-    dt2 = dt2.clamp(-MAX_STEP_PER_FRAME, MAX_STEP_PER_FRAME);
-
-    // --- PASSO 5: Atualizar os Ângulos ---
-    // Atualiza os ângulos na direção do gradiente negativo
-    arm.angles.x += dt1;
-    arm.angles.y += dt2;
 }
 
 /// Sistema Bevy para desenhar o estado atual do braço e o alvo
